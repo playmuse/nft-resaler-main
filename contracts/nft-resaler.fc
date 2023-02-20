@@ -1,0 +1,214 @@
+;; NFT Resaler by delpydoc@github.com/xJetLabs
+
+{-
+    Storage
+    owner_address:MsgAddressInt (267 bits)
+    provider_address:MsgAddressInt (267 bits)
+    price:Coins
+    nfts_count:uint32
+    owned_nfts:dict[
+        index:uint32$
+            item_address:MsgAddressInt (267 bits)
+    ]
+-}
+
+global slice store::owner_address;
+global slice store::provider_address;
+global int store::price;
+global int store::nfts_count;
+global cell store::owned_nfts;
+
+#include "constants.fc";
+#include "utils.fc";
+
+() load_data() impure inline {
+    slice ds = get_data().begin_parse();
+    store::owner_address = ds~load_msg_addr();
+    store::provider_address = ds~load_msg_addr();
+    store::price = ds~load_coins();
+    store::nfts_count = ds~load_uint(32);
+    store::owned_nfts = ds~load_dict();
+    ds.end_parse();
+}
+
+() save_data() impure inline {
+    set_data(
+        begin_cell()
+            .store_slice(store::owner_address)
+            .store_slice(store::provider_address)
+            .store_coins(store::price)
+            .store_uint(store::nfts_count, 32)
+            .store_dict(store::owned_nfts)
+            .end_cell()
+    );
+}
+
+() send_nft(slice nft_address, slice target_address) impure inline {
+    send_raw_message(
+        begin_cell()
+            .store_uint(0x18, 6) ;; bounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
+            .store_slice(nft_address)
+            .store_coins(50000000) ;; 0.05 TON
+            .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_ref(
+                begin_cell()
+                    .store_uint(op::transfer, 32)
+                    .store_uint(0, 64)
+                    .store_slice(target_address)
+                    .store_slice(target_address)
+                    .store_uint(0, 1)
+                    .store_coins(1)
+                    .store_uint(0, 1)
+                    .end_cell()
+            ).end_cell()
+        , 1
+    );
+}
+
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+    slice cs = in_msg_full.begin_parse();
+    int flags = cs~load_uint(4);
+
+    if (flags & 1) { ;; ignore all bounced messages
+        return ();
+    }
+
+    slice sender_address = cs~load_msg_addr();
+
+    int op = in_msg_body.slice_bits() >= 32 ? in_msg_body~load_uint(32) : 0;
+    if (op == op::ownership_assigned) {
+        accept_message();
+    }
+    if (op == 7) {
+        return ();
+    }
+
+    load_data();
+
+    if (op == op::ownership_assigned) {
+        in_msg_body~skip_bits(64);
+        slice previous_owner = in_msg_body~load_msg_addr();
+        if (equal_slices(store::provider_address, previous_owner) | equal_slices(store::owner_address, previous_owner)) {
+            force_chain(sender_address);
+            (int index, _, int found?) = store::owned_nfts.udict_get_max?(32);
+            index = found? ? index + 1 : 0;
+
+            store::owned_nfts~udict_set_builder(32, index, begin_cell().store_slice(sender_address));
+            store::nfts_count += 1;
+
+            save_data();
+            return ();
+        } else {
+            throw_unless(401, msg_value >= 50000000); ;; 0.05 TON
+            send_nft(sender_address, previous_owner);
+            return ();
+        }
+    }
+    if (op == 3) { ;; edit sale price
+        throw_unless(401, equal_slices(store::owner_address, sender_address));
+        store::price = in_msg_body~load_coins();
+        save_data();
+        return ();
+    }
+    if (op == 4) { ;; edit provider address
+        throw_unless(401, equal_slices(store::owner_address, sender_address));
+        store::provider_address = in_msg_body~load_msg_addr();
+        save_data();
+        return ();
+    }
+    if (op == 10) { ;; edit owner address
+        throw_unless(401, equal_slices(store::owner_address, sender_address));
+        store::owner_address = in_msg_body~load_msg_addr();
+        save_data();
+        return ();
+    }
+    if (op == 11) { ;; remove some nft from sale
+        throw_unless(401, equal_slices(store::owner_address, sender_address));
+        (store::owned_nfts, _) = store::owned_nfts.udict_delete?(32, in_msg_body~load_uint(32));
+        store::nfts_count -= 1;
+        save_data();
+        return ();
+    }
+    if (op == 5) {
+        throw_unless(401, equal_slices(store::owner_address, sender_address));
+
+        slice target_address = in_msg_body~load_msg_addr();
+        int amount = in_msg_body~load_coins();
+        cell msg_body = in_msg_body.slice_refs() >= 1 ? in_msg_body~load_ref() : begin_cell().end_cell();
+
+        cell msg = begin_cell()
+            .store_uint(0x18, 6) ;; bounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
+            .store_slice(target_address)
+            .store_coins(amount)
+            .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_ref(msg_body).end_cell();
+
+        send_raw_message(msg, 0);
+        return ();
+    }
+
+    if ((op == 0) & (msg_value >= store::price)) { ;; purchase
+        int remains_count = msg_value / store::price;
+        remains_count = min(remains_count, store::nfts_count);
+        remains_count = min(remains_count, 200);
+        int remains_value = msg_value - (remains_count * store::price);
+        (int len, int txt) = encode_number_to_text(remains_count);
+
+        (int _highest_index, _, _) = store::owned_nfts.udict_get_max?(32);
+        while (remains_count > 0) {
+            randomize_lt();
+            int v = rand(_highest_index + 1);
+            (int index, slice value, int found?) = store::owned_nfts.udict_get_nexteq?(32, v);
+            if (~ found?) {
+                (index, value, found?) = store::owned_nfts.udict_get_next?(32, 0);
+            }
+            throw_unless(500, found?);
+            send_nft(value~load_msg_addr(), sender_address);
+
+            (store::owned_nfts, int removed?) = store::owned_nfts.udict_delete?(32, index);
+            throw_unless(501, removed?);
+            remains_count -= 1;
+            store::nfts_count -= 1;
+        }
+
+        save_data();
+
+        cell msg_body = begin_cell()
+            .store_uint(0, 32)
+            .store_slice(text::successful_minted())
+            .store_uint(txt, len * 8) ;; (count)
+            .store_uint(0x204e4654, 8 * 4) ;; ( NFT)
+            .end_cell();
+
+        cell msg = begin_cell()
+            .store_uint(0x10, 6) ;; nobounce - int_msg_info$0 ihr_disabled:Bool bounce:Bool bounced:Bool src:MsgAddress -> 011000
+            .store_slice(sender_address)
+            .store_coins(remains_value)
+            .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+            .store_ref(msg_body).end_cell();
+
+        send_raw_message(msg, 3);
+        return ();
+    }
+
+    throw(0xffff);
+}
+
+;; GET methods
+
+(int, int) get_sale() method_id {
+    load_data();
+    return (store::price, store::nfts_count);
+}
+
+(int, int) get_provider() method_id {
+    load_data();
+    return parse_std_addr(store::provider_address);
+}
+
+(int, int) get_owner() method_id {
+    load_data();
+    return parse_std_addr(store::owner_address);
+}
+
+
